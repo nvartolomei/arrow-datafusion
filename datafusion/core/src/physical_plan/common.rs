@@ -228,20 +228,6 @@ impl<T> Future for AbortOnDropSingle<T> {
     }
 }
 
-/// Helper that aborts the given join handles on drop.
-///
-/// Useful to kill background tasks when the consumer is dropped.
-#[derive(Debug)]
-pub struct AbortOnDropMany<T>(pub Vec<JoinHandle<T>>);
-
-impl<T> Drop for AbortOnDropMany<T> {
-    fn drop(&mut self) {
-        for join_handle in &self.0 {
-            join_handle.abort();
-        }
-    }
-}
-
 /// Transposes the given vector of vectors.
 pub fn transpose<T>(original: Vec<Vec<T>>) -> Vec<Vec<T>> {
     match original.as_slice() {

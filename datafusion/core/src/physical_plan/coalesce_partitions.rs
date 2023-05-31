@@ -204,21 +204,25 @@ impl Stream for MergeStream {
         // If the input stream is done, wait for all tasks to finish and return
         // the failure if any.
         if let Poll::Ready(None) = poll {
-            let fut = self.tasks.join_next();
-            tokio::pin!(fut);
+            loop {
+                let fut = self.tasks.join_next();
+                tokio::pin!(fut);
 
-            match fut.poll(cx) {
-                Poll::Ready(task_poll) => {
-                    if let Some(Err(e)) = task_poll {
-                        if e.is_panic() {
-                            panic::resume_unwind(e.into_panic());
+                match fut.poll(cx) {
+                    Poll::Ready(Some(Ok(()))) => {}
+                    Poll::Ready(Some(Err(err))) => {
+                        if err.is_panic() {
+                            panic::resume_unwind(err.into_panic());
                         }
                         return Poll::Ready(Some(Err(DataFusionError::Execution(
-                            format!("{e:?}"),
+                            format!("{err:?}"),
                         ))));
                     }
+                    Poll::Ready(None) => {
+                        break;
+                    }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Pending => {}
             }
         }
 

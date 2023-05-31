@@ -37,7 +37,7 @@ use log::trace;
 
 use self::distributor_channels::{DistributionReceiver, DistributionSender};
 
-use super::common::{AbortOnDropMany, AbortOnDropSingle, SharedMemoryReservation};
+use super::common::SharedMemoryReservation;
 use super::expressions::PhysicalSortExpr;
 use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{RecordBatchStream, SendableRecordBatchStream};
@@ -45,14 +45,12 @@ use super::{RecordBatchStream, SendableRecordBatchStream};
 use crate::execution::context::TaskContext;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::Stream;
-use futures::{FutureExt, StreamExt};
+use futures::{future, Future, FutureExt, StreamExt};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 mod distributor_channels;
-
-type MaybeBatch = Option<Result<RecordBatch>>;
 
 /// Inner state of [`RepartitionExec`].
 #[derive(Debug)]
@@ -62,14 +60,12 @@ struct RepartitionExecState {
     channels: HashMap<
         usize,
         (
-            DistributionSender<MaybeBatch>,
-            DistributionReceiver<MaybeBatch>,
+            DistributionSender<Result<RecordBatch>>,
+            DistributionReceiver<Result<RecordBatch>>,
             SharedMemoryReservation,
         ),
     >,
-
-    /// Helper that ensures that that background job is killed once it is no longer needed.
-    abort_helper: Arc<AbortOnDropMany<()>>,
+    supervisor_handle: Option<future::Shared<RepartitionSupervisorHandle>>,
 }
 
 /// A utility that can be used to partition batches based on [`Partitioning`]
@@ -383,7 +379,7 @@ impl ExecutionPlan for RepartitionExec {
             }
 
             // launch one async task per *input* partition
-            let mut join_handles = Vec::with_capacity(num_input_partitions);
+            let mut tasks = JoinSet::new();
             for i in 0..num_input_partitions {
                 let txs: HashMap<_, _> = state
                     .channels
@@ -395,28 +391,28 @@ impl ExecutionPlan for RepartitionExec {
 
                 let r_metrics = RepartitionMetrics::new(i, partition, &self.metrics);
 
-                let input_task: JoinHandle<Result<()>> =
-                    tokio::spawn(Self::pull_from_input(
-                        self.input.clone(),
-                        i,
-                        txs.clone(),
-                        self.partitioning.clone(),
-                        r_metrics,
-                        context.clone(),
-                    ));
-
-                // In a separate task, wait for each input to be done
-                // (and pass along any errors, including panic!s)
-                let join_handle = tokio::spawn(Self::wait_for_task(
-                    AbortOnDropSingle::new(input_task),
-                    txs.into_iter()
-                        .map(|(partition, (tx, _reservation))| (partition, tx))
-                        .collect(),
+                tasks.spawn(Self::repartition_input(
+                    self.input.clone(),
+                    i,
+                    txs.clone(),
+                    self.partitioning.clone(),
+                    r_metrics,
+                    context.clone(),
                 ));
-                join_handles.push(join_handle);
             }
 
-            state.abort_helper = Arc::new(AbortOnDropMany(join_handles))
+            // Start the supervisor task.
+            state.supervisor_handle = Some(
+                RepartitionSupervisorHandle(tokio::spawn(Self::supervise_tasks(
+                    tasks,
+                    state
+                        .channels
+                        .iter()
+                        .map(|(partition, (tx, _, _))| (*partition, tx.clone()))
+                        .collect(),
+                )))
+                .shared(),
+            );
         }
 
         trace!(
@@ -431,11 +427,9 @@ impl ExecutionPlan for RepartitionExec {
             .remove(&partition)
             .expect("partition not used yet");
         Ok(Box::pin(RepartitionStream {
-            num_input_partitions,
-            num_input_partitions_processed: 0,
             schema: self.input.schema(),
             input: rx,
-            drop_helper: Arc::clone(&state.abort_helper),
+            supervisor_handle: state.supervisor_handle.clone(),
             reservation,
         }))
     }
@@ -477,7 +471,7 @@ impl RepartitionExec {
             partitioning,
             state: Arc::new(Mutex::new(RepartitionExecState {
                 channels: HashMap::new(),
-                abort_helper: Arc::new(AbortOnDropMany::<()>(vec![])),
+                supervisor_handle: None,
             })),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -489,12 +483,15 @@ impl RepartitionExec {
     /// i is the input partition index
     ///
     /// txs hold the output sending channels for each output partition
-    async fn pull_from_input(
+    async fn repartition_input(
         input: Arc<dyn ExecutionPlan>,
         i: usize,
         mut txs: HashMap<
             usize,
-            (DistributionSender<MaybeBatch>, SharedMemoryReservation),
+            (
+                DistributionSender<Result<RecordBatch>>,
+                SharedMemoryReservation,
+            ),
         >,
         partitioning: Partitioning,
         r_metrics: RepartitionMetrics,
@@ -532,7 +529,7 @@ impl RepartitionExec {
                 if let Some((tx, reservation)) = txs.get_mut(&partition) {
                     reservation.lock().try_grow(size)?;
 
-                    if tx.send(Some(Ok(batch))).await.is_err() {
+                    if tx.send(Ok(batch)).await.is_err() {
                         // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
                         reservation.lock().shrink(size);
                         txs.remove(&partition);
@@ -568,45 +565,41 @@ impl RepartitionExec {
         Ok(())
     }
 
-    /// Waits for `input_task` which is consuming one of the inputs to
-    /// complete. Upon each successful completion, sends a `None` to
-    /// each of the output tx channels to signal one of the inputs is
-    /// complete. Upon error, propagates the errors to all output tx
-    /// channels.
-    async fn wait_for_task(
-        input_task: AbortOnDropSingle<Result<()>>,
-        txs: HashMap<usize, DistributionSender<Option<Result<RecordBatch>>>>,
+    async fn supervise_tasks(
+        mut tasks: JoinSet<Result<()>>,
+        txs: HashMap<usize, DistributionSender<Result<RecordBatch>>>,
     ) {
-        // wait for completion, and propagate error
-        // note we ignore errors on send (.ok) as that means the receiver has already shutdown.
-        match input_task.await {
-            // Error in joining task
-            Err(e) => {
-                let e = Arc::new(e);
+        loop {
+            match tasks.join_next().await {
+                // Error in joining task
+                Some(Err(e)) => {
+                    let e = Arc::new(e);
 
-                for (_, tx) in txs {
-                    let err = Err(DataFusionError::Context(
-                        "Join Error".to_string(),
-                        Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
-                    ));
-                    tx.send(Some(err)).await.ok();
+                    for (_, tx) in &txs {
+                        let err = Err(DataFusionError::Context(
+                            "Join Error".to_string(),
+                            Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
+                        ));
+                        tx.send(err).await.ok();
+                    }
                 }
-            }
-            // Error from running input task
-            Ok(Err(e)) => {
-                let e = Arc::new(e);
+                // Error from running input task
+                Some(Ok(Err(e))) => {
+                    let e = Arc::new(e);
 
-                for (_, tx) in txs {
-                    // wrap it because need to send error to all output partitions
-                    let err = Err(DataFusionError::External(Box::new(e.clone())));
-                    tx.send(Some(err)).await.ok();
+                    for (_, tx) in &txs {
+                        // wrap it because need to send error to all output partitions
+                        let err = Err(DataFusionError::External(Box::new(e.clone())));
+                        tx.send(err).await.ok();
+                    }
                 }
-            }
-            // Input task completed successfully
-            Ok(Ok(())) => {
-                // notify each output partition that this input partition has no more data
-                for (_, tx) in txs {
-                    tx.send(None).await.ok();
+                Some(Ok(Ok(()))) => {
+                    // Input task completed successfully
+                    continue;
+                }
+                None => {
+                    // All input tasks have completed
+                    break;
                 }
             }
         }
@@ -614,21 +607,14 @@ impl RepartitionExec {
 }
 
 struct RepartitionStream {
-    /// Number of input partitions that will be sending batches to this output channel
-    num_input_partitions: usize,
-
-    /// Number of input partitions that have finished sending batches to this output channel
-    num_input_partitions_processed: usize,
-
     /// Schema wrapped by Arc
     schema: SchemaRef,
 
     /// channel containing the repartitioned batches
-    input: DistributionReceiver<MaybeBatch>,
+    input: DistributionReceiver<Result<RecordBatch>>,
 
-    /// Handle to ensure background tasks are killed when no longer needed.
-    #[allow(dead_code)]
-    drop_helper: Arc<AbortOnDropMany<()>>,
+    /// Handle for the supervisor.
+    supervisor_handle: Option<future::Shared<RepartitionSupervisorHandle>>,
 
     /// Memory reservation.
     reservation: SharedMemoryReservation,
@@ -641,34 +627,36 @@ impl Stream for RepartitionStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.input.recv().poll_unpin(cx) {
-                Poll::Ready(Some(Some(v))) => {
-                    if let Ok(batch) = &v {
-                        self.reservation
-                            .lock()
-                            .shrink(batch.get_array_memory_size());
-                    }
+        match self.input.recv().poll_unpin(cx) {
+            Poll::Ready(Some(v)) => {
+                if let Ok(batch) = &v {
+                    self.reservation
+                        .lock()
+                        .shrink(batch.get_array_memory_size());
+                }
 
-                    return Poll::Ready(Some(v));
-                }
-                Poll::Ready(Some(None)) => {
-                    self.num_input_partitions_processed += 1;
+                return Poll::Ready(Some(v));
+            }
+            Poll::Ready(None) => {
+                // Wait for the supervisor to finish to ensure that all potential errors were handled.
+                return match self.supervisor_handle.as_mut() {
+                    Some(h) => match h.poll_unpin(cx) {
+                        Poll::Ready(None) => Poll::Ready(None),
+                        Poll::Ready(Some(e)) => {
+                            self.supervisor_handle = None;
 
-                    if self.num_input_partitions == self.num_input_partitions_processed {
-                        // all input partitions have finished sending batches
-                        return Poll::Ready(None);
-                    } else {
-                        // other partitions still have data to send
-                        continue;
-                    }
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
+                            Poll::Ready(Some(Err(DataFusionError::Context(
+                                "RepartitionSupervisor Error".to_string(),
+                                Box::new(DataFusionError::External(Box::new(e))),
+                            ))))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    },
+                    None => Poll::Ready(None),
+                };
+            }
+            Poll::Pending => {
+                return Poll::Pending;
             }
         }
     }
@@ -678,6 +666,29 @@ impl RecordBatchStream for RepartitionStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[derive(Debug)]
+struct RepartitionSupervisorHandle(JoinHandle<()>);
+
+impl Future for RepartitionSupervisorHandle {
+    type Output = Option<Arc<DataFusionError>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.poll_unpin(cx).map(|res| match res {
+            Ok(()) => None,
+            Err(e) => Some(Arc::new(DataFusionError::Internal(format!(
+                "Error in repartition supervisor: {:?}",
+                e
+            )))),
+        })
+    }
+}
+
+impl Drop for RepartitionSupervisorHandle {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
